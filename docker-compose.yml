@@ -1,0 +1,16 @@
+services:
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"        
+    environment:
+      
+      - SERVICES=s3,lambda,dynamodb,apigateway,sqs,sns
+    volumes:
+      - ./scripts/configuracao.sh:/etc/localstack/init/ready.d/configuracao.sh
+      - ./src:/src
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "localstack_volume:/var/lib/localstack"
+
+volumes:
+  localstack_volume:
