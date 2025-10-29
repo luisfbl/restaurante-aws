@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  localstack:
+    image: localstack/localstack
+    ports:
+      - "4566:4566"  # Porta principal da AWS
+      - "4571:4571"  # Porta do Web UI (não obrigatório)
+    environment:
+      - SERVICES=${SERVICES}
+      - DEBUG=${DEBUG}
+      - LAMBDA_EXECUTOR=${LAMBDA_EXECUTOR}
+      - DOCKER_HOST=${DOCKER_HOST}
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
