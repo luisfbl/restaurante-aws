@@ -39,7 +39,7 @@ awslocal lambda create-function \
   --zip-file fileb:///tmp/processar_pedido.zip \
   --region us-east-1 \
   --timeout 60 \
-  --environment "Variables={AWS_ENDPOINT_URL=http://localstack:4566}"
+  --environment "Variables={AWS_ENDPOINT_URL=http://localstack:4566,S3_BUCKET_NAME=comprovantes-pedidos,SNS_TOPIC_ARN=arn:aws:sns:us-east-1:000000000000:PedidosConcluidos}"
 
 API_ID=$(awslocal apigateway create-rest-api \
   --name pedidos-api \
