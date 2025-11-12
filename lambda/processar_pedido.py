@@ -1,101 +1,185 @@
 import json
-import boto3
 import os
+from datetime import datetime
+from decimal import Decimal
 from io import BytesIO
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
 
-# Configuração do cliente boto3 para S3 e SNS apontando para o LocalStack
-LOCALSTACK_HOSTNAME = os.environ.get('LOCALSTACK_HOSTNAME', 'localhost')
-EDGE_PORT = os.environ.get('EDGE_PORT', '4566')
-ENDPOINT_URL = f"http://{LOCALSTACK_HOSTNAME}:{EDGE_PORT}"
+import boto3
+from botocore.exceptions import ClientError
 
-s3_client = boto3.client('s3', endpoint_url=ENDPOINT_URL)
-sns_client = boto3.client('sns', endpoint_url=ENDPOINT_URL)
+LOCALSTACK_HOSTNAME = os.environ.get("LOCALSTACK_HOSTNAME", "localhost")
+EDGE_PORT = os.environ.get("EDGE_PORT", "4566")
+ENDPOINT_URL = os.environ.get(
+    "AWS_ENDPOINT_URL", f"http://{LOCALSTACK_HOSTNAME}:{EDGE_PORT}"
+)
+AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "comprovantes-pedidos")
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "Pedidos")
 
-BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', 'comprovantes-pedidos')
-# ARN do tópico SNS para notificações
-SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+session = boto3.session.Session(region_name=AWS_REGION)
+s3_client = session.client("s3", endpoint_url=ENDPOINT_URL)
+sns_client = session.client("sns", endpoint_url=ENDPOINT_URL)
+dynamodb = session.resource("dynamodb", endpoint_url=ENDPOINT_URL)
+pedidos_table = dynamodb.Table(DYNAMODB_TABLE)
+
+
+def _escape_pdf_text(value):
+    text = str(value)
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _build_pdf_document(content_bytes):
+    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    objects = []
+
+    objects.append(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n")
+    objects.append(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n")
+    objects.append(
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n"
+    )
+
+    stream_header = f"<< /Length {len(content_bytes)} >>\nstream\n".encode("utf-8")
+    stream_footer = b"\nendstream\n"
+    objects.append(b"4 0 obj\n" + stream_header + content_bytes + stream_footer + b"endobj\n")
+
+    objects.append(
+        b"5 0 obj << /Type /Font /Subtype /Type1 /Name /F1 /BaseFont /Helvetica >> endobj\n"
+    )
+
+    offsets = []
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+
+    xref_pos = len(pdf)
+    total_objs = len(objects) + 1
+    pdf.extend(f"xref\n0 {total_objs}\n".encode("utf-8"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("utf-8"))
+
+    pdf.extend(
+        f"trailer << /Size {total_objs} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF".encode(
+            "utf-8"
+        )
+    )
+    return bytes(pdf)
+
 
 def generate_pdf(data):
-    """Gera um PDF simples em memória com os dados da mensagem."""
     try:
-        buffer = BytesIO()
+        lines = ["BT", "/F1 18 Tf", "50 780 Td (Comprovante de Pedido) Tj"]
 
-        p = canvas.Canvas(buffer, pagesize=A4)
-        width, height = A4 
+        cliente = data.get("cliente", "N/A")
+        mesa = data.get("mesa", "N/A")
+        pedido_id = data.get("id_pedido", "N/A")
 
-        p.setFont("Helvetica-Bold", 18)
-        p.drawString(100, height - 100, "Comprovante de Pedido")
-        
-        p.setFont("Helvetica", 12)
-        p.drawString(100, height - 130, f"ID do Pedido: {data.get('id_pedido', 'N/A')}")
-        p.drawString(100, height - 150, f"Cliente: {data.get('cliente', 'N/A')}")
-        p.drawString(100, height - 170, f"Mesa: {data.get('mesa', 'N/A')}")
-        
-        p.setFont("Helvetica-Bold", 12)
-        p.drawString(100, height - 200, "Itens do Pedido:")
-        p.setFont("Helvetica", 10)
-        
-        itens = data.get('itens', [])
-        for i, item in enumerate(itens):
-            p.drawString(120, height - 220 - (i * 20), f"- {item}")
+        lines.append(
+            "0 -30 Td /F1 12 Tf ({}) Tj".format(_escape_pdf_text(f"ID: {pedido_id}"))
+        )
+        lines.append("0 -18 Td ({}) Tj".format(_escape_pdf_text(f"Cliente: {cliente}")))
+        lines.append("0 -18 Td ({}) Tj".format(_escape_pdf_text(f"Mesa: {mesa}")))
+        lines.append("0 -24 Td (Itens:) Tj")
 
-        p.showPage()
-        p.save()
+        for item in data.get("itens", []):
+            lines.append("0 -18 Td ({}) Tj".format(_escape_pdf_text(f"- {item}")))
 
-        buffer.seek(0)
-        return buffer
-        
-    except Exception as e:
-        print(f"Erro ao gerar PDF: {e}")
+        lines.append("ET")
+        content_bytes = "\n".join(lines).encode("utf-8")
+        pdf_bytes = _build_pdf_document(content_bytes)
+        return BytesIO(pdf_bytes)
+    except Exception as err:
+        print(f"Erro ao gerar PDF: {err}")
         return None
 
-def handler(event, context):
-    """Função principal da Lambda."""
-    
-    print("Evento SQS recebido...")
-    
-    for record in event['Records']:
+
+def _fetch_order(pedido_id):
+    try:
+        response = pedidos_table.get_item(Key={"id": pedido_id})
+        return response.get("Item")
+    except ClientError as error:
+        print(f"Erro ao buscar pedido {pedido_id}: {error}")
+        return None
+
+
+def _update_status(pedido_id, status, comprovante_url=None):
+    timestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    expression = ["#status = :status", "#updated_at = :updated"]
+    names = {"#status": "status", "#updated_at": "atualizado_em"}
+    values = {":status": status, ":updated": timestamp}
+
+    if comprovante_url is not None:
+        expression.append("#comprovante_url = :comprovante")
+        names["#comprovante_url"] = "comprovante_url"
+        values[":comprovante"] = comprovante_url
+
+    update_expression = "SET " + ", ".join(expression)
+
+    try:
+        pedidos_table.update_item(
+            Key={"id": pedido_id},
+            UpdateExpression=update_expression,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+    except ClientError as error:
+        print(f"Erro ao atualizar pedido {pedido_id}: {error}")
+
+
+def handler(event, _context):
+    for record in event["Records"]:
         try:
-            
-            message_body_str = record['body']
-            data = json.loads(message_body_str)
-            print(f"Processando dados: {data}")
+            payload = json.loads(record["body"])
+            pedido_id = payload.get("pedido_id") or payload.get("id")
+            if not pedido_id:
+                print("Mensagem sem 'pedido_id'. Ignorando.")
+                continue
 
+            pedido = _fetch_order(pedido_id)
+            if not pedido:
+                print(f"Pedido {pedido_id} não encontrado.")
+                continue
 
-            pdf_buffer = generate_pdf(data)
-            
-            if pdf_buffer:
-                file_name = f"relatorio-{data.get('id_pedido', 'default')}.pdf"
-                
-                s3_client.put_object(
-                    Bucket=BUCKET_NAME,
-                    Key=file_name,
-                    Body=pdf_buffer,
-                    ContentType='application/pdf'
-                )
-                print(f"Sucesso! PDF salvo em s3://{BUCKET_NAME}/{file_name}")
+            itens = pedido.get("itens", [])
+            mesa = pedido.get("mesa")
+            if isinstance(mesa, Decimal):
+                mesa = int(mesa)
 
-                if SNS_TOPIC_ARN:
-                    sns_subject = "Pedido Pronto!"
-                    sns_message = f"Novo pedido concluído: {data.get('id_pedido', 'N/A')}"
-                    
-                    sns_client.publish(
-                        TopicArn=SNS_TOPIC_ARN,
-                        Message=sns_message,
-                        Subject=sns_subject
-                    )
-                    print(f"Notificação de pedido concluído enviada para o tópico {SNS_TOPIC_ARN}")
-                else:
-                    print("Variável de ambiente SNS_TOPIC_ARN não configurada. Pulando notificação.")
-            else:
-                print("Falha ao gerar o buffer do PDF.")
+            _update_status(pedido_id, "processando")
+            pdf_buffer = generate_pdf(
+                {
+                    "id_pedido": pedido_id,
+                    "cliente": pedido.get("cliente", "N/A"),
+                    "mesa": mesa,
+                    "itens": itens,
+                }
+            )
 
-        except Exception as e:
-            print(f"Erro ao processar registro: {e}")
-            
-    return {
-        'statusCode': 200,
-        'body': json.dumps('Processamento concluído.')
-    }
+            if not pdf_buffer:
+                _update_status(pedido_id, "erro")
+                continue
+
+            object_key = f"comprovantes/{pedido_id}.pdf"
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key=object_key,
+                Body=pdf_buffer.getvalue(),
+                ContentType="application/pdf",
+            )
+            comprovante_url = f"s3://{BUCKET_NAME}/{object_key}"
+            print(f"PDF salvo em {comprovante_url}")
+
+            _update_status(pedido_id, "concluido", comprovante_url)
+
+            sns_client.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Message=f"Novo pedido concluído: {pedido_id}",
+                Subject="Pedido Pronto!",
+            )
+
+        except Exception as error:
+            print(f"Erro ao processar registro: {error}")
+
+    return {"statusCode": 200, "body": json.dumps("Processamento concluído.")}
